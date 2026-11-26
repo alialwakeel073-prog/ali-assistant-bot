@@ -1,0 +1,27 @@
+# Render Blueprint: free web service running the Telegram bot in webhook mode.
+# Deploy: push these files to a GitHub repo, then in Render choose
+# "New +" -> "Blueprint" and pick the repo, or "New Web Service" and
+# point it at the repo. Set the secret env vars in the Render dashboard
+# (they are marked sync: false here, so Render will ask for them).
+
+services:
+  - type: web
+    name: telegram-assistant-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: RUN_MODE
+        value: webhook
+      # Optional: comma-separated Telegram user IDs allowed to use the bot.
+      # Leave empty to allow anyone who finds the bot.
+      - key: ALLOWED_USER_IDS
+        sync: false
+    # Render sets PORT and RENDER_EXTERNAL_URL automatically.
