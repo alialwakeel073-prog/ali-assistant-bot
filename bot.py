@@ -17,9 +17,11 @@ imported (and smoke-tested) without any keys set.
 
 import base64
 import html
+import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -228,14 +230,64 @@ TOPIC_KEYWORDS: dict[str, set[str]] = {
 }
 
 
+# Stop words that must NEVER drive a search match.
+# "بس" (just/only) appears in almost every Arabic deal post
+# ("بـ 38 ريال بس"), so matching on it returned random posts
+# (a Bonat gift-card post, a Philips vacuum) for Ali's
+# "/search حذاء رياضي النهارده بس" on 2026-11-27. Date words
+# ("النهارده" / "today") are also stop words — they are a date
+# filter (see _is_today_query), not something to match on.
+STOP_WORDS = {
+    "بس", "فقط", "دي", "ده", "دا", "في", "من", "على", "إلى", "الى",
+    "عن", "مع", "و", "كده", "كدا", "اي", "أي",
+    "النهارده", "النهاردة", "اليوم", "today",
+    "the", "a", "an", "in", "on", "for", "only", "just", "day",
+}
+TODAY_WORDS = {"النهارده", "النهاردة", "اليوم", "today"}
+
+
+def _search_words(query: str) -> tuple[list[str], bool]:
+    """Split a search query into (content words, today_only).
+
+    Stop words are dropped before any matching, so a query like
+    "حذاء رياضي النهارده بس" matches on ["حذاء", "رياضي"] only.
+    today_only is True when the query asks for today
+    ("النهارده" / "النهاردة" / "اليوم" / "today").
+    """
+    raw = [w.strip().lower() for w in query.split() if w.strip()]
+    today_only = any(w in TODAY_WORDS for w in raw)
+    content = [w for w in raw if w not in STOP_WORDS]
+    return content, today_only
+
+
+def _today_str() -> str:
+    """Today's date (YYYY-MM-DD) in Riyadh time, the user's clock."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+
+        return _dt.now(ZoneInfo("Asia/Riyadh")).date().isoformat()
+    except Exception:  # noqa: BLE001 - zoneinfo missing, local date
+        from datetime import date as _date
+
+        return _date.today().isoformat()
+
+
+def _is_today_query(query: str) -> bool:
+    """True when the query asks for today's posts only."""
+    return _search_words(query)[1]
+
+
 def _channels_for_query(query: str) -> list[str] | None:
     """Pick the topic channels for a query by keyword.
 
     Weather words -> weather channels, news words -> news channels,
-    tech words -> tech channels. Returns None when no topic matches
-    (the caller then uses the general fallback: jobs + news).
+    tech words -> tech channels. Stop words are stripped first, so
+    "بس" / "النهارده" never route a query to a topic by accident.
+    Returns None when no topic matches (the caller then uses the
+    general fallback: jobs + news).
     """
-    words = {w.strip().lower() for w in query.split() if w.strip()}
+    words = set(_search_words(query)[0])
     for topic, keywords in TOPIC_KEYWORDS.items():
         if words & keywords:
             if topic == "offers":
@@ -255,49 +307,55 @@ def search_telegram_general(query: str) -> tuple[list[dict], str]:
     so a post that only mentions الرياض is not a false match) plus
     the news channels (any query word).
 
+    Matching rules (fixed 2026-11-27 after Ali's report):
+    - Stop words ("بس", "النهارده", ...) are removed first; a post
+      must match a real CONTENT word (brand/category), never a
+      stop word alone.
+    - "النهارده" / "today" filters to posts dated today only.
+    - When nothing matches, return ([], "channels") — NEVER the
+      channels' latest posts. Showing unrelated latest posts as
+      search results was misleading (Bonat card, Philips vacuum).
+
     Returns (results, source) where source is "channels" (real
-    matches) or "topic" (no post contained the query words, so the
-    channels' latest posts are returned instead, labelled as such).
-    Never raises: on total failure it returns ([], "channels").
+    matches) or "empty" (the query had no content word left after
+    stop-word removal, e.g. "/search بس"). Never raises: on total
+    failure it returns ([], "channels").
     """
-    words = [w.strip().lower() for w in query.split() if w.strip()]
+    words, today_only = _search_words(query)
+    if not words:
+        return [], "empty"
+    today = _today_str() if today_only else ""
+
+    def _ok(post: dict) -> bool:
+        if today and post.get("date") != today:
+            return False
+        return _post_matches(post, words)
+
     channels = _channels_for_query(query)
     if channels is not None:
         # Topic channels: a news post almost never contains the
         # literal words "أخبار السعودية", and a weather post rarely
         # says "طقس" — the channel itself IS the topic — so prefer
-        # posts matching ANY query word, and if none match, return
-        # the channels' latest posts (source "topic").
+        # posts matching ANY content word.
         channel_results = search_telegram_web(query, channels)
-        matched = [post for post in channel_results
-                   if _post_matches(post, words)]
-        if matched:
-            return matched[:SEARCH_MAX_RESULTS], "channels"
-        latest: list[dict] = []
-        for channel in channels:
-            latest.extend(_fetch_channel_posts(channel)[:3])
-        return latest[:SEARCH_MAX_RESULTS], "topic"
+        matched = [post for post in channel_results if _ok(post)]
+        return matched[:SEARCH_MAX_RESULTS], "channels"
     # General fallback (no topic matched): jobs + news.
     job_results = search_telegram_web(query, SEARCH_CHANNELS)
     job_filtered = [post for post in job_results
                     if all(w in (post["text"] + " "
                                 + post.get("image_text", "")).lower()
-                           for w in words)]
+                           for w in words)
+                    and (not today or post.get("date") == today)]
     news_results = search_telegram_web(query, TOPIC_CHANNELS["news"])
-    news_matched = [post for post in news_results
-                    if _post_matches(post, words)]
+    news_matched = [post for post in news_results if _ok(post)]
     seen: set[str] = set()
     combined: list[dict] = []
     for post in job_filtered + news_matched:
         if post["link"] not in seen:
             seen.add(post["link"])
             combined.append(post)
-    if combined:
-        return combined[:SEARCH_MAX_RESULTS], "channels"
-    latest = []
-    for channel in TOPIC_CHANNELS["news"]:
-        latest.extend(_fetch_channel_posts(channel)[:3])
-    return latest[:SEARCH_MAX_RESULTS], "topic"
+    return combined[:SEARCH_MAX_RESULTS], "channels"
 
 
 def _fetch_channel_posts(channel: str) -> list[dict]:
@@ -486,15 +544,17 @@ def search_telegram_web(query: str,
     """Search public channels for posts matching the query.
 
     `channels` defaults to SEARCH_CHANNELS (jobs). A post matches
-    when it contains any of the query words. Results are ranked by
-    how many query words they contain, most first, and capped at
+    when it contains any of the query's CONTENT words — stop words
+    ("بس", "النهارده", ...) are removed first and can never match
+    a post on their own. Results are ranked by how many content
+    words they contain, most first, and capped at
     SEARCH_MAX_RESULTS. For the offer channels, posts whose text
     did not match are also checked by reading their images
     (vision, at most 3 images per search) — a match from an image
     is returned with from_image=True. Never raises: on total
     failure it returns an empty list.
     """
-    words = [w.strip().lower() for w in query.split() if w.strip()]
+    words, _today_only = _search_words(query)
     if not words:
         words = [w.lower() for w in SEARCH_DEFAULT_QUERY.split()]
     if channels is None:
@@ -525,6 +585,481 @@ def search_telegram_web(query: str,
         except Exception:  # noqa: BLE001 - text results still stand
             logger.warning("Image search failed, keeping text results")
     return results[:SEARCH_MAX_RESULTS]
+
+
+# ---------------------------------------------------------------------------
+# Scheduled offer watcher (/watch) — runs FROM the bot, not from Muse.
+#
+# How it works: Ali adds a watch with /watch (e.g.
+# "/watch سنيكرز أديداس 100-200"). The watches + the last-seen post
+# id per channel + already-alerted post links are stored in
+# watches.json next to this file (loaded at startup, saved on every
+# change). A scheduled task on PythonAnywhere (Tasks tab) POSTs to
+# /watchcheck every 30 minutes; that endpoint runs check_watches()
+# and sends new matching offers to Ali on Telegram.
+#
+# NEW POSTS ONLY: a post counts as new only when its numeric id is
+# greater than the channel's stored last_seen. last_seen is updated
+# on every run even for non-matching posts, so an old post is never
+# reported twice — and the first run for a channel only records the
+# baseline (no alerts), so posts that already existed when the
+# watch was created do not alert. seen_links is a second guard:
+# a post link is never alerted twice, even across restarts.
+#
+# Matching is fuzzy on purpose (Ali asked for that): brand or
+# category words, Arabic or English, in the post text OR in the
+# post image (vision, offer channels only, at most 3 images per
+# check). The price must fall inside the watch's range.
+# No search-engine scraping, no Telethon, no login.
+# ---------------------------------------------------------------------------
+WATCH_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "watches.json")
+_watch_lock = threading.Lock()
+WATCH_SEEN_LINKS_CAP = 500
+
+DEFAULT_WATCHES = [
+    {
+        "query": "حذاء رياضي سنيكرز أديداس نايكي اسيكس",
+        "min_price": 100,
+        "max_price": 200,
+        "channels": list(OFFER_CHANNELS),
+    },
+    {
+        "query": "هودي هانس",
+        "min_price": 100,
+        "max_price": 200,
+        "channels": list(OFFER_CHANNELS),
+    },
+]
+
+
+def _default_watch_state() -> dict:
+    """Fresh watch state: the two seeded watches, no baseline yet."""
+    import copy
+
+    return {
+        "watches": copy.deepcopy(DEFAULT_WATCHES),
+        "last_seen": {},  # channel -> highest post id seen so far
+        "seen_links": [],  # post links already alerted (never twice)
+    }
+
+
+def _load_watch_state() -> dict:
+    """Load watches.json (or the seeded defaults when it is missing)."""
+    state = _default_watch_state()
+    try:
+        with open(WATCH_STATE_FILE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except (OSError, ValueError):
+        return state
+    if not isinstance(saved, dict):
+        return state
+    if isinstance(saved.get("watches"), list):
+        state["watches"] = [
+            w for w in saved["watches"]
+            if isinstance(w, dict) and w.get("query")
+        ]
+    if isinstance(saved.get("last_seen"), dict):
+        state["last_seen"] = {
+            str(k): int(v) for k, v in saved["last_seen"].items()
+            if str(v).isdigit()
+        }
+    if isinstance(saved.get("seen_links"), list):
+        state["seen_links"] = [
+            link for link in saved["seen_links"]
+            if isinstance(link, str)
+        ][-WATCH_SEEN_LINKS_CAP:]
+    return state
+
+
+def _save_watch_state(state: dict) -> None:
+    """Save watches.json atomically (write temp file, then replace)."""
+    tmp_path = WATCH_STATE_FILE + ".tmp"
+    with _watch_lock:
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, WATCH_STATE_FILE)
+        except OSError:
+            logger.warning("Could not save watch state")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def _normalize_arabic(text: str) -> str:
+    """Normalise Arabic for fuzzy matching: alef variants, ة/ى, digits."""
+    text = (text or "").translate(_ARABIC_DIGITS).lower()
+    text = re.sub(r"[\u064b-\u0652]", "", text)  # tashkeel
+    text = re.sub(r"[أإآٱ]", "ا", text)
+    text = text.replace("ة", "ه").replace("ى", "ي")
+    return text
+
+
+# Synonym expansion for watch keywords (normalised forms).
+_WATCH_SYNONYMS: dict[str, set[str]] = {
+    "اديداس": {"adidas"},
+    "adidas": {"اديداس"},
+    "نايكي": {"nike"},
+    "nike": {"نايكي"},
+    "اسيكس": {"asics"},
+    "asics": {"اسيكس"},
+    "هانس": {"hanes"},
+    "hanes": {"هانس"},
+    "هودي": {"hoodie"},
+    "hoodie": {"هودي"},
+    "حذاء": {"shoes", "sneakers", "شوز", "سنيكرز"},
+    "سنيكرز": {"sneakers", "حذاء", "شوز"},
+    "شوز": {"shoes", "sneakers", "حذاء", "سنيكرز"},
+    "shoes": {"حذاء", "شوز", "سنيكرز"},
+    "sneakers": {"سنيكرز", "حذاء", "شوز"},
+}
+
+# Words too generic to match on their own (modifiers / stopwords).
+_WATCH_SKIP_WORDS = {
+    "رياضي", "رياضيه", "من", "في", "علي", "على", "الي", "الى",
+    "و", "او", "مع", "بعد", "قبل", "عن", "لـ", "لل", "ال",
+}
+
+
+def _watch_keywords(watch: dict) -> set[str]:
+    """Keyword set for a watch: its query words + synonyms."""
+    words = set()
+    for word in _normalize_arabic(watch.get("query", "")).split():
+        word = word.strip(".,!؟")
+        if len(word) < 2 or word in _WATCH_SKIP_WORDS:
+            continue
+        words.add(word)
+        words.update(_WATCH_SYNONYMS.get(word, set()))
+    return words
+
+
+def _extract_prices(text: str) -> list[int]:
+    """All SAR prices in a post text, in order of appearance.
+
+    Matches "61 ريال", "61 ر", "61 SAR", "61 ر.س" (incl. Arabic
+    digits). Skips numbers that are not product prices: caps
+    ("بحد 50 ريال") and thresholds ("بأكثر من 250 ريال").
+    """
+    found: list[int] = []
+    pattern = re.compile(
+        r"(\d[\d,]*)\s*(?:ريال|ر\.س|SAR|ر(?=\s|$))")
+    for match in pattern.finditer(text or ""):
+        before = _normalize_arabic(text[max(0, match.start() - 25):
+                                        match.start()])
+        if ("بحد" in before or "اكثر من" in before
+                or "حد اقصي" in before or "حد اقصى" in before):
+            continue
+        try:
+            value = int(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if value > 0:
+            found.append(value)
+    return found
+
+
+def _final_price(text: str) -> tuple[int | None, int | None]:
+    """(final price, old price) from a post text.
+
+    The final price is the lowest price shown (after discounts and
+    bank discounts); the old price is the highest, when different.
+    Returns (None, None) when no price is in the text.
+    """
+    prices = _extract_prices(text)
+    if not prices:
+        return None, None
+    final = min(prices)
+    before = max(prices) if max(prices) != final else None
+    return final, before
+
+
+def _post_id(post: dict) -> int | None:
+    """Numeric post id from a post link, or None."""
+    try:
+        return int(post.get("link", "").rsplit("/", 1)[-1])
+    except (ValueError, AttributeError):
+        return None
+
+
+def _watch_matches(watch: dict, text: str, image_text: str = "") -> bool:
+    """True when any watch keyword appears in the text or image text."""
+    keywords = _watch_keywords(watch)
+    if not keywords:
+        return False
+    haystack = _normalize_arabic((text or "") + " " + (image_text or ""))
+    return any(keyword in haystack for keyword in keywords)
+
+
+def _store_link_from_text(text: str) -> str:
+    """First store/Amazon link in a post text, or ""."""
+    for url in re.findall(r"https?://[^\s\"'<>]+", text or ""):
+        low = url.lower()
+        if "t.me" in low:
+            continue
+        if any(host in low for host in
+               ("amazon", "amzlinks", "noon", "temu", "trendyol")):
+            return url
+    return ""
+
+
+def _make_alert(watch: dict, channel: str, post: dict,
+                final: int, before: int | None,
+                image_text: str = "") -> dict:
+    """One alert dict, ready to format and send."""
+    return {
+        "channel": channel,
+        "channel_name": channel,
+        "product": watch.get("query", ""),
+        "price_before": before,
+        "price_after": final,
+        "post_link": post.get("link", ""),
+        "store_link": _store_link_from_text(post.get("text", "")),
+        "from_image": bool(image_text),
+        "excerpt": (post.get("text", "") or "")[:200],
+    }
+
+
+def _format_alert(alert: dict) -> str:
+    """Arabic alert message: channel name + post link + price."""
+    lines = [
+        "🔔 عرض جديد!",
+        f"{alert.get('product', '')}",
+        f"القناة: {alert.get('channel_name', '')}",
+    ]
+    after = alert.get("price_after")
+    before = alert.get("price_before")
+    if after is not None:
+        price = f"السعر: {after} ريال"
+        if before is not None:
+            price += f" (بدل {before} ريال)"
+        lines.append(price)
+    if alert.get("from_image"):
+        lines.append("📷 من الصورة")
+    if alert.get("excerpt"):
+        lines.append(alert["excerpt"])
+    if alert.get("post_link"):
+        lines.append(f"رابط البوست: {alert['post_link']}")
+    if alert.get("store_link"):
+        lines.append(f"رابط الشراء: {alert['store_link']}")
+    return "\n".join(lines)
+
+
+def check_watches() -> list[dict]:
+    """Check all watches against NEW posts only; return new alerts.
+
+    Fetches each watched channel once, keeps only posts newer than
+    the stored last_seen for that channel, and updates last_seen
+    even for non-matching posts. A channel whose fetch fails keeps
+    its old last_seen, so the next run retries it. The first run
+    for a channel only records the baseline (no alerts), so posts
+    that already existed when the watch was created never alert.
+    Image reading (vision) is used only for new posts in the offer
+    channels, at most IMAGE_SEARCH_MAX_IMAGES images per check.
+    Never raises: any failure yields fewer / no alerts.
+    """
+    state = _load_watch_state()
+    watches = state.get("watches", [])
+    if not watches:
+        return []
+    channels_needed = sorted({
+        ch for watch in watches
+        for ch in watch.get("channels") or _offer_channels()
+    })
+    posts_by_channel: dict[str, list[dict] | None] = {}
+    for channel in channels_needed:
+        try:
+            posts_by_channel[channel] = _fetch_channel_posts(channel)
+        except Exception:  # noqa: BLE001 - retry next run, keep last_seen
+            logger.warning("Watch check: could not fetch %s", channel)
+            posts_by_channel[channel] = None
+
+    alerts: list[dict] = []
+    seen_links = set(state.get("seen_links", []))
+    images_used = 0
+    offer_channels = set(_offer_channels())
+    for channel, posts in posts_by_channel.items():
+        if posts is None:
+            continue  # fetch failed — do not move last_seen
+        ids = [i for i in (_post_id(p) for p in posts) if i is not None]
+        if not ids:
+            continue
+        max_id = max(ids)
+        last = state["last_seen"].get(channel)
+        if last is None:
+            # First run for this channel: record the baseline only.
+            state["last_seen"][channel] = max_id
+            continue
+        new_posts = [p for p in posts
+                     if (_post_id(p) or 0) > last]
+        state["last_seen"][channel] = max_id
+        for post in new_posts:
+            if post["link"] in seen_links:
+                continue
+            matched = False
+            for watch in watches:
+                if channel not in (watch.get("channels")
+                                   or _offer_channels()):
+                    continue
+                if _watch_matches(watch, post.get("text", "")):
+                    final, before = _final_price(post.get("text", ""))
+                    if (final is not None
+                            and watch["min_price"] <= final
+                            <= watch["max_price"]):
+                        alerts.append(_make_alert(
+                            watch, channel, post, final, before))
+                        seen_links.add(post["link"])
+                        matched = True
+                        break
+            if matched or not post.get("images"):
+                continue
+            # Text did not match: try reading the post image
+            # (offer channels only, shared 3-image budget per check).
+            if channel not in offer_channels:
+                continue
+            if images_used >= IMAGE_SEARCH_MAX_IMAGES:
+                continue
+            images_used += 1
+            try:
+                image_bytes = _download_image(post["images"][0])
+            except Exception:  # noqa: BLE001 - text-only fallback
+                image_bytes = None
+            if not image_bytes:
+                continue
+            try:
+                image_text = _vision_extract_text(image_bytes)
+            except Exception:  # noqa: BLE001 - text-only fallback
+                image_text = ""
+            if not image_text:
+                continue
+            for watch in watches:
+                if channel not in (watch.get("channels")
+                                   or _offer_channels()):
+                    continue
+                if _watch_matches(watch, "", image_text):
+                    final, before = _final_price(image_text)
+                    if (final is not None
+                            and watch["min_price"] <= final
+                            <= watch["max_price"]):
+                        alerts.append(_make_alert(
+                            watch, channel, post, final, before,
+                            image_text=image_text))
+                        seen_links.add(post["link"])
+                        break
+    state["seen_links"] = sorted(seen_links)[-WATCH_SEEN_LINKS_CAP:]
+    _save_watch_state(state)
+    return alerts
+
+
+def _parse_watch_args(args: list[str]) -> tuple[str, int, int] | None:
+    """Parse /watch args: "<product...> <min>-<max>" (range optional).
+
+    Returns (query, min_price, max_price), or None when there is no
+    product name. Without a range the price is unlimited (0..999999).
+    """
+    text = " ".join(args).strip()
+    if not text:
+        return None
+    match = re.search(r"(\d+)\s*-\s*(\d+)\s*$", text)
+    if match:
+        query = text[:match.start()].strip()
+        low, high = int(match.group(1)), int(match.group(2))
+        if low > high:
+            low, high = high, low
+    else:
+        query, low, high = text, 0, 999999
+    if not query:
+        return None
+    return query, low, high
+
+
+def _format_watches(state: dict) -> str:
+    """Arabic list of the current watches, numbered for /unwatch."""
+    watches = state.get("watches", [])
+    if not watches:
+        return ("مفيش مراقبات شغالة دلوقتي.\n"
+                "ضيف واحدة كده:\n/watch سنيكرز أديداس 100-200")
+    lines = ["المراقبات الشغالة دلوقتي:\n"]
+    for i, watch in enumerate(watches, 1):
+        low, high = watch["min_price"], watch["max_price"]
+        price = (f"من {low} لـ {high} ريال" if high < 999999
+                 else "أي سعر")
+        channels = ", ".join(watch.get("channels") or _offer_channels())
+        lines.append(f"{i}. «{watch['query']}» — {price}\n"
+                     f"   القنوات: {channels}")
+    return "\n".join(lines)
+
+
+async def watch_command(update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add or list watches (/watch [product min-max]).
+
+    Ali only. "/watch" with no args lists the current watches;
+    "/watch سنيكرز أديداس 100-200" adds one. The watch is saved
+    in watches.json and the scheduled /watchcheck call checks it.
+    """
+    if not is_allowed(update.effective_user.id):
+        return  # silently ignore strangers: do not confirm the bot exists
+    args = list(context.args) if context.args else []
+    if not args:
+        state = _load_watch_state()
+        await update.message.reply_text(
+            _format_watches(state)
+            + "\n\nضيف مراقبة جديدة كده:\n"
+              "/watch سنيكرز أديداس 100-200\n"
+              "وامسح واحدة بـ /unwatch رقمها")
+        return
+    parsed = _parse_watch_args(args)
+    if not parsed:
+        await update.message.reply_text(
+            "ابعتها كده: /watch سنيكرز أديداس 100-200\n"
+            "أو من غير سعر: /watch هودي هانس")
+        return
+    query, low, high = parsed
+    state = _load_watch_state()
+    state["watches"].append({
+        "query": query,
+        "min_price": low,
+        "max_price": high,
+        "channels": _offer_channels(),
+    })
+    _save_watch_state(state)
+    price = (f"من {low} لـ {high} ريال" if high < 999999 else "أي سعر")
+    await update.message.reply_text(
+        f"تمام، هتابع «{query}» — {price} — في قنوات العروض. ✅\n"
+        "هبعتلك تنبيه هنا أول ما ينزل بوست جديد بالسعر ده، "
+        "ومش هكرر نفس العرض تاني.\n"
+        "الفحص بيتم كل 30 دقيقة من مهمة مجدولة على PythonAnywhere "
+        "(شوف الشرح في PYTHONANYWHERE-README.md).\n"
+        "تشوف المراقبات بـ /watch، وتمسح واحدة بـ /unwatch رقمها.")
+
+
+async def unwatch_command(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove one watch by its number (/unwatch <n>). Ali only."""
+    if not is_allowed(update.effective_user.id):
+        return  # silently ignore strangers: do not confirm the bot exists
+    args = list(context.args) if context.args else []
+    state = _load_watch_state()
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            _format_watches(state)
+            + "\n\nامسح واحدة كده: /unwatch 1")
+        return
+    index = int(args[0]) - 1
+    watches = state.get("watches", [])
+    if index < 0 or index >= len(watches):
+        await update.message.reply_text(
+            "الرقم ده مش موجود. شوف الأرقام بـ /watch")
+        return
+    removed = watches.pop(index)
+    _save_watch_state(state)
+    await update.message.reply_text(
+        f"تمام، مسحت مراقبة «{removed['query']}». ✅")
 
 
 def _check_search_limit(user_id: int) -> bool:
@@ -576,16 +1111,22 @@ async def search_command(update: Update,
             "معلش، السيرش مش شغال دلوقتي. جرّب تاني بعد شوية.")
         return
     if not results:
+        if source == "empty":
+            await update.message.reply_text(
+                "قولي كلمة أدور عليها، زي: /search حذاء رياضي "
+                "أو /search هودي هانس")
+            return
+        if _is_today_query(query):
+            await update.message.reply_text(
+                f"ملقيتش حاجة عن «{query}» النهارده في تليجرام. "
+                "جرّب كلمة تانية، مثلاً: /search حذاء رياضي")
+            return
         await update.message.reply_text(
             f"ملقيتش حاجة عن «{query}» في تليجرام. "
             "جرّب كلمة تانية، مثلاً: /search محاسب الرياض")
         return
     where = "من قنوات تليجرام"
-    if source == "topic":
-        lines = [f"ملقيتش بوست فيه «{query}» بالظبط، "
-                 "بس دي أحدث البوستات من قنوات الموضوع على تليجرام:\n"]
-    else:
-        lines = [f"لقيت {len(results)} نتيجة عن «{query}» {where}:\n"]
+    lines = [f"لقيت {len(results)} نتيجة عن «{query}» {where}:\n"]
     for post in results:
         excerpt = post["text"][:200]
         date = f" ({post['date']})" if post["date"] else ""
@@ -783,6 +1324,8 @@ START_TEXT = (
     "/help - شرح الأوامر\n"
     "/search - دوّر في تليجرام عن أي حاجة (مثال: /search محاسب الرياض، /search طقس، /search أخبار) — في قنوات العروض بقرا الصور كمان\n"
     "/addchannel - ضيف قناة للسيرش (مثال: /addchannel Aziz_deals)\n"
+    "/watch - تابع عرض جديد (مثال: /watch سنيكرز أديداس 100-200) — تنبيه مرة واحدة أول ما ينزل بوست جديد بالسعر ده\n"
+    "/unwatch - امسح مراقبة (مثال: /unwatch 1)\n"
     "/new - بداية محادثة جديدة (بيمسح ذاكرة المحادثة)\n"
     "/clear - نفس /new\n\n"
     "ملحوظة: أنا برد على الرسايل النصية بس دلوقتي."
@@ -794,6 +1337,8 @@ HELP_TEXT = (
     "/help - عرض المساعدة دي\n"
     "/search - دوّر في تليجرام عن أي حاجة (مثال: /search محاسب الرياض، /search طقس، /search أخبار) — في قنوات العروض بقرا الصور كمان\n"
     "/addchannel - ضيف قناة للسيرش (مثال: /addchannel Aziz_deals)\n"
+    "/watch - تابع عرض جديد (مثال: /watch سنيكرز أديداس 100-200) — تنبيه مرة واحدة أول ما ينزل بوست جديد بالسعر ده\n"
+    "/unwatch - امسح مراقبة (مثال: /unwatch 1)\n"
     "/new - محادثة جديدة (مسح ذاكرة المحادثة)\n"
     "/clear - نفس /new\n\n"
     "غير كده، ابعتلي سؤالك كتابة وأنا هرد عليك. "
@@ -943,6 +1488,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("addchannel", addchannel_command))
+    app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("unwatch", unwatch_command))
     app.add_handler(CommandHandler("new", clear_history))
     app.add_handler(CommandHandler("clear", clear_history))
     # Text messages first, then anything else (photo, voice, sticker...).

@@ -10,6 +10,11 @@ plain Flask app:
   sends WEBHOOK_SECRET back in the X-Telegram-Bot-Api-Secret-Token
   header with every update; the secret NEVER appears in the URL,
   because server access logs record full request URLs.
+- POST /watchcheck            -> scheduled offer-watch check, guarded
+  by the SAME WEBHOOK_SECRET header. Runs bot.check_watches() and
+  sends any new matching offers to Ali on Telegram. Called by a
+  scheduled task on PythonAnywhere (Tasks tab) every 30 minutes —
+  the free web app sleeps and cannot run its own background loop.
 
 The python-telegram-bot Application is created once and lives on a
 dedicated asyncio event loop running in a background thread, because
@@ -28,9 +33,12 @@ No secrets are hardcoded. All config comes from environment variables
 """
 
 import asyncio
+import json
 import logging
 import os
 import threading
+import urllib.error
+import urllib.request
 
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, request
@@ -156,3 +164,78 @@ def telegram_webhook():
         return jsonify({"status": "error",
                         "error": "telegram application unavailable"}), 500
     return jsonify({"status": "ok"}), 200
+
+
+def _send_telegram_message(chat_id: int, text: str) -> bool:
+    """Send one message via the Telegram Bot API (raw HTTP, proxy-aware).
+
+    The token is used only inside the request URL and is never logged.
+    Returns True when Telegram answered 200.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token or not chat_id:
+        return False
+    payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot" + token + "/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler())
+    try:
+        with opener.open(req, timeout=15) as resp:
+            return resp.status == 200
+    except Exception as exc:  # noqa: BLE001 - a failed send must not crash
+        logger.warning("Watch alert send failed (%s)", type(exc).__name__)
+        return False
+
+
+@app.route("/watchcheck", methods=["POST"])
+def watch_check():
+    """Scheduled offer-watch check, guarded by the WEBHOOK_SECRET header.
+
+    A scheduled task on PythonAnywhere POSTs here every 30 minutes.
+    Runs bot.check_watches() in a worker thread (it fetches channels
+    and may read images, so it can take a while), then sends each new
+    alert to Ali (the first ALLOWED_USER_IDS id) on Telegram.
+    No new matching offer -> nothing is sent, {"alerts": 0}.
+    The same header as /webhook is required; unset secret -> 403.
+    """
+    expected = os.getenv("WEBHOOK_SECRET", "")
+    provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not expected or provided != expected:
+        abort(403)
+
+    result: dict = {}
+
+    def _do() -> None:
+        try:
+            from bot import check_watches
+
+            result["alerts"] = check_watches()
+        except Exception:  # noqa: BLE001 - never crash the endpoint
+            logger.exception("Watch check failed")
+            result["alerts"] = []
+
+    thread = threading.Thread(target=_do, daemon=True, name="watch-check")
+    thread.start()
+    thread.join(timeout=180)
+    if thread.is_alive():
+        return jsonify({"status": "timeout", "alerts": 0}), 200
+
+    alerts = result.get("alerts", [])
+    sent = 0
+    if alerts:
+        try:
+            from bot import ALLOWED_USER_IDS, _format_alert
+
+            chat_id = (sorted(ALLOWED_USER_IDS)[0]
+                       if ALLOWED_USER_IDS else None)
+        except Exception:  # noqa: BLE001 - no recipient, count only
+            chat_id = None
+        if chat_id:
+            for alert in alerts:
+                if _send_telegram_message(chat_id, _format_alert(alert)):
+                    sent += 1
+    return jsonify({"status": "ok", "alerts": len(alerts),
+                    "sent": sent}), 200
