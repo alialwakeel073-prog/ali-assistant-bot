@@ -15,6 +15,7 @@ No real API call is made at import time, so the module can be
 imported (and smoke-tested) without any keys set.
 """
 
+import base64
 import html
 import logging
 import os
@@ -144,6 +145,44 @@ SEARCH_MIN_SECONDS = 30  # at most 1 search per user every 30 seconds
 SEARCH_MAX_RESULTS = 5
 SEARCH_DEFAULT_QUERY = "محاسب الرياض"
 
+# Offer channels: image reading (OCR/vision) is scoped to THESE
+# channels only, plus any channel Ali adds with /addchannel.
+# They are the offer channels Ali sent: strongoffers (قناص العروض),
+# Aziz_deals (عروض البطاقات والتسوق), RF_Thebest (صيد العروض).
+# Permanent list — edit here and redeploy to change it for good.
+OFFER_CHANNELS = [
+    "strongoffers",
+    "Aziz_deals",
+    "RF_Thebest",
+]
+# Channels added at runtime with /addchannel (in-memory only — they
+# are lost on restart; edit OFFER_CHANNELS above to keep one).
+EXTRA_CHANNELS: set[str] = set()
+
+
+def _offer_channels() -> list[str]:
+    """Offer channels: the built-in list + any added via /addchannel."""
+    return OFFER_CHANNELS + sorted(EXTRA_CHANNELS)
+
+
+# Image reading (vision) for /search, offer channels only.
+# At most 3 images per search, first image of each candidate post,
+# max 1 MB per image, so one search stays fast and cheap.
+IMAGE_SEARCH_MAX_IMAGES = 3
+IMAGE_MAX_BYTES = 1_000_000
+# Vision models (OpenAI-compatible chat with image_url). Groq first,
+# Gemini fallback — same endpoints/keys as the chat AI, no new keys.
+# meta-llama/llama-4-scout-17b-16e-instruct is Groq's vision model
+# on the free tier; gemini-2.5-flash also accepts images.
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
+VISION_PROMPT = (
+    "Extract all visible text from this product image. "
+    "Return only: product name, brand, and prices in SAR "
+    "(old price and new price if shown), one item per line. "
+    "If there is no readable text, reply with just: NO_TEXT"
+)
+
 # In-memory timestamps of allowed searches per user id.
 _search_timestamps: dict[int, float] = {}
 
@@ -172,12 +211,20 @@ TOPIC_CHANNELS: dict[str, list[str]] = {
     "news": ["saudinews50", "alsaudinews1", "News_Ejazah"],
     # تقنية / tech — Arabic tech news
     "tech": ["aitnews"],
+    # عروض / offers — Ali's offer channels (image reading applies here)
+    "offers": OFFER_CHANNELS,
 }
 TOPIC_KEYWORDS: dict[str, set[str]] = {
     "weather": {"طقس", "الطقس", "weather", "امطار", "أمطار", "حرارة"},
     "news": {"أخبار", "اخبار", "خبر", "news", "عاجل"},
     "tech": {"تقنية", "تكنولوجيا", "tech", "ذكاء", "اصطناعي", "هاتف",
              "آيفون", "ايفون", "اندرويد", "أندرويد"},
+    # منتجات وعروض — brand/category words route to the offer channels
+    "offers": {"عرض", "عروض", "خصم", "تخفيض", "كوبون", "منتج",
+               "حذاء", "أحذية", "احذية", "هودي", "سنيكرز", "شوز",
+               "أديداس", "اديداس", "نايكي", "اسيكس", "هانس",
+               "adidas", "nike", "asics", "hanes", "hoodie",
+               "sneakers", "shoes", "أمازون", "amazon", "نون", "noon"},
 }
 
 
@@ -191,6 +238,8 @@ def _channels_for_query(query: str) -> list[str] | None:
     words = {w.strip().lower() for w in query.split() if w.strip()}
     for topic, keywords in TOPIC_KEYWORDS.items():
         if words & keywords:
+            if topic == "offers":
+                return _offer_channels()
             return TOPIC_CHANNELS[topic]
     return None
 
@@ -221,7 +270,7 @@ def search_telegram_general(query: str) -> tuple[list[dict], str]:
         # the channels' latest posts (source "topic").
         channel_results = search_telegram_web(query, channels)
         matched = [post for post in channel_results
-                   if any(w in post["text"].lower() for w in words)]
+                   if _post_matches(post, words)]
         if matched:
             return matched[:SEARCH_MAX_RESULTS], "channels"
         latest: list[dict] = []
@@ -231,10 +280,12 @@ def search_telegram_general(query: str) -> tuple[list[dict], str]:
     # General fallback (no topic matched): jobs + news.
     job_results = search_telegram_web(query, SEARCH_CHANNELS)
     job_filtered = [post for post in job_results
-                    if all(w in post["text"].lower() for w in words)]
+                    if all(w in (post["text"] + " "
+                                + post.get("image_text", "")).lower()
+                           for w in words)]
     news_results = search_telegram_web(query, TOPIC_CHANNELS["news"])
     news_matched = [post for post in news_results
-                    if any(w in post["text"].lower() for w in words)]
+                    if _post_matches(post, words)]
     seen: set[str] = set()
     combined: list[dict] = []
     for post in job_filtered + news_matched:
@@ -252,8 +303,11 @@ def search_telegram_general(query: str) -> tuple[list[dict], str]:
 def _fetch_channel_posts(channel: str) -> list[dict]:
     """Fetch the recent public posts of one channel via t.me/s/<channel>.
 
-    Returns a list of {"link", "date", "text"}. Never raises: on any
-    fetch/parse failure it returns an empty list.
+    Returns a list of {"link", "date", "text", "images", "from_image"}.
+    "images" are the post's photo URLs (Telegram's own CDN,
+    cdn*.telesco.pe) — used only for image reading in the offer
+    channels. Never raises: on any fetch/parse failure it returns
+    an empty list.
     """
     url = f"https://t.me/s/{channel}"
     req = urllib.request.Request(
@@ -284,12 +338,147 @@ def _fetch_channel_posts(channel: str) -> list[dict]:
             continue
         date_match = re.search(r'datetime="([^"]+)"', body)
         date = date_match.group(1)[:10] if date_match else ""
+        # Post photos: background-image:url('https://cdn*.telesco.pe/...')
+        # inside this post's chunk. Keep the first 2, de-duplicated.
+        # NOTE: emoji are also rendered as background images
+        # (//telegram.org/img/emoji/...) — ignore anything that is
+        # not a real photo on Telegram's CDN, or the vision step
+        # would waste its 3-image budget on emoji.
+        images: list[str] = []
+        for img_url in re.findall(
+                r"background-image:url\('([^']+)'\)", body):
+            if "telesco.pe" not in img_url:
+                continue
+            if img_url not in images:
+                images.append(img_url)
+            if len(images) >= 2:
+                break
         posts.append({
             "link": f"https://t.me/{channel}/{post_id.split('/')[-1]}",
             "date": date,
             "text": text,
+            "images": images,
+            "from_image": False,
         })
     return posts
+
+
+def _post_matches(post: dict, words: list[str]) -> bool:
+    """True when a post matches any query word in its text or image text."""
+    haystack = (post.get("text", "") + " "
+                + post.get("image_text", "")).lower()
+    return any(w in haystack for w in words)
+
+
+def _download_image(url: str) -> bytes | None:
+    """Download one post image (Telegram's own CDN only).
+
+    Returns the bytes, or None on any failure / oversize / wrong host.
+    Only cdn*.telesco.pe hosts are fetched — the URLs come from the
+    t.me/s page itself, never from user input.
+    """
+    import urllib.parse
+
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return None
+    if not (host == "telesco.pe" or host.endswith(".telesco.pe")):
+        return None
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; AliBot/1.0)"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler())
+    try:
+        with opener.open(req, timeout=10) as resp:
+            data = resp.read(IMAGE_MAX_BYTES + 1)
+    except Exception:  # noqa: BLE001 - a dead image must not break search
+        return None
+    if len(data) > IMAGE_MAX_BYTES:
+        return None
+    return data
+
+
+def _vision_extract_text(image_bytes: bytes) -> str:
+    """Extract visible text from one image via the vision API.
+
+    Groq vision model first, Gemini vision fallback — the same
+    OpenAI-compatible endpoints and keys as the chat AI, no new
+    keys and no new dependencies. Returns "" when no key is set
+    or the call fails (caller falls back to text-only results).
+    """
+    data_url = ("data:image/jpeg;base64,"
+                + base64.b64encode(image_bytes).decode("ascii"))
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": VISION_PROMPT},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]}]
+    if GROQ_API_KEY:
+        try:
+            text = _call_openai_compatible(
+                GROQ_API_KEY, GROQ_BASE_URL, GROQ_VISION_MODEL, messages)
+            if text and text.strip().upper() != "NO_TEXT":
+                return text.strip()
+            return text.strip() if text else ""
+        except Exception as exc:  # noqa: BLE001 - fall through to Gemini
+            logger.warning("Groq vision call failed (%s)",
+                           type(exc).__name__)
+    if GEMINI_API_KEY:
+        try:
+            text = _call_openai_compatible(
+                GEMINI_API_KEY, GEMINI_BASE_URL, GEMINI_VISION_MODEL,
+                messages)
+            if text and text.strip().upper() != "NO_TEXT":
+                return text.strip()
+            return text.strip() if text else ""
+        except Exception as exc:  # noqa: BLE001 - give up, text-only
+            logger.warning("Gemini vision call failed (%s)",
+                           type(exc).__name__)
+    return ""
+
+
+def _image_search(posts: list[dict], words: list[str],
+                  seen_links: set[str]) -> list[dict]:
+    """Image reading for the offer channels only.
+
+    For posts from OFFER_CHANNELS (+ /addchannel) whose TEXT did not
+    match, download at most IMAGE_SEARCH_MAX_IMAGES images (first
+    image of each candidate post) and read their text with vision.
+    A post matches when its image text contains a query word.
+    Never raises: any failure just yields fewer / no image results.
+    """
+    offer = set(_offer_channels())
+    candidates: list[dict] = []
+    for post in posts:
+        if len(candidates) >= IMAGE_SEARCH_MAX_IMAGES:
+            break
+        channel = post["link"].split("/")[3] if post["link"] else ""
+        if channel not in offer:
+            continue
+        if post["link"] in seen_links:
+            continue
+        if not post.get("images"):
+            continue
+        if any(w in post["text"].lower() for w in words):
+            continue  # already a text match — no need to read its image
+        candidates.append(post)
+    results: list[dict] = []
+    for post in candidates:
+        try:
+            image_bytes = _download_image(post["images"][0])
+        except Exception:  # noqa: BLE001 - never crash the search
+            image_bytes = None
+        if not image_bytes:
+            continue
+        try:
+            image_text = _vision_extract_text(image_bytes)
+        except Exception:  # noqa: BLE001 - never crash the search
+            image_text = ""
+        if image_text and any(w in image_text.lower() for w in words):
+            matched = dict(post)
+            matched["image_text"] = image_text[:300]
+            matched["from_image"] = True
+            results.append(matched)
+    return results
 
 
 def search_telegram_web(query: str,
@@ -299,8 +488,11 @@ def search_telegram_web(query: str,
     `channels` defaults to SEARCH_CHANNELS (jobs). A post matches
     when it contains any of the query words. Results are ranked by
     how many query words they contain, most first, and capped at
-    SEARCH_MAX_RESULTS. Never raises: on total failure it returns
-    an empty list.
+    SEARCH_MAX_RESULTS. For the offer channels, posts whose text
+    did not match are also checked by reading their images
+    (vision, at most 3 images per search) — a match from an image
+    is returned with from_image=True. Never raises: on total
+    failure it returns an empty list.
     """
     words = [w.strip().lower() for w in query.split() if w.strip()]
     if not words:
@@ -311,16 +503,28 @@ def search_telegram_web(query: str,
     # accountant anywhere beats a post about Riyadh with no job.
     job_words = {"محاسب", "محاسبة", "accountant", "accounting",
                  "مالية", "finance"}
-    scored: list[tuple[int, dict]] = []
+    all_posts: list[dict] = []
     for channel in channels:
-        for post in _fetch_channel_posts(channel):
-            haystack = post["text"].lower()
-            hits = sum(1 for w in words if w in haystack)
-            if hits:
-                bonus = 5 if any(j in haystack for j in job_words) else 0
-                scored.append((hits * 10 + bonus, post))
+        all_posts.extend(_fetch_channel_posts(channel))
+    scored: list[tuple[int, dict]] = []
+    seen_links: set[str] = set()
+    for post in all_posts:
+        haystack = post["text"].lower()
+        hits = sum(1 for w in words if w in haystack)
+        if hits:
+            bonus = 5 if any(j in haystack for j in job_words) else 0
+            scored.append((hits * 10 + bonus, post))
+            seen_links.add(post["link"])
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [post for _, post in scored[:SEARCH_MAX_RESULTS]]
+    results = [post for _, post in scored[:SEARCH_MAX_RESULTS]]
+    if len(results) < SEARCH_MAX_RESULTS:
+        # Offer channels only: try reading images of unmatched posts.
+        try:
+            results.extend(
+                _image_search(all_posts, words, seen_links))
+        except Exception:  # noqa: BLE001 - text results still stand
+            logger.warning("Image search failed, keeping text results")
+    return results[:SEARCH_MAX_RESULTS]
 
 
 def _check_search_limit(user_id: int) -> bool:
@@ -385,7 +589,12 @@ async def search_command(update: Update,
     for post in results:
         excerpt = post["text"][:200]
         date = f" ({post['date']})" if post["date"] else ""
-        lines.append(f"• {excerpt}{date}\n{post['link']}")
+        if post.get("from_image"):
+            image_note = (post.get("image_text", "")[:200] or "")
+            lines.append(f"• {excerpt}{date}\n📷 من الصورة: {image_note}"
+                         f"\n{post['link']}")
+        else:
+            lines.append(f"• {excerpt}{date}\n{post['link']}")
     await update.message.reply_text("\n\n".join(lines))
 
 
@@ -572,7 +781,8 @@ START_TEXT = (
     "عايز مساعدة فيها، وأنا هرد عليك على طول.\n\n"
     "أوامر مفيدة:\n"
     "/help - شرح الأوامر\n"
-    "/search - دوّر في تليجرام عن أي حاجة (مثال: /search محاسب الرياض، /search طقس، /search أخبار)\n"
+    "/search - دوّر في تليجرام عن أي حاجة (مثال: /search محاسب الرياض، /search طقس، /search أخبار) — في قنوات العروض بقرا الصور كمان\n"
+    "/addchannel - ضيف قناة للسيرش (مثال: /addchannel Aziz_deals)\n"
     "/new - بداية محادثة جديدة (بيمسح ذاكرة المحادثة)\n"
     "/clear - نفس /new\n\n"
     "ملحوظة: أنا برد على الرسايل النصية بس دلوقتي."
@@ -582,7 +792,8 @@ HELP_TEXT = (
     "دي الأوامر اللي أقدر أعملها:\n\n"
     "/start - بداية وتعارف\n"
     "/help - عرض المساعدة دي\n"
-    "/search - دوّر في تليجرام عن أي حاجة (مثال: /search محاسب الرياض، /search طقس، /search أخبار)\n"
+    "/search - دوّر في تليجرام عن أي حاجة (مثال: /search محاسب الرياض، /search طقس، /search أخبار) — في قنوات العروض بقرا الصور كمان\n"
+    "/addchannel - ضيف قناة للسيرش (مثال: /addchannel Aziz_deals)\n"
     "/new - محادثة جديدة (مسح ذاكرة المحادثة)\n"
     "/clear - نفس /new\n\n"
     "غير كده، ابعتلي سؤالك كتابة وأنا هرد عليك. "
@@ -594,6 +805,66 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update.effective_user.id):
         return  # silently ignore strangers: do not confirm the bot exists
     await update.message.reply_text(START_TEXT)
+
+
+def _parse_channel_arg(arg: str) -> str | None:
+    """Parse a channel name from /addchannel input.
+
+    Accepts "Aziz_deals", "@Aziz_deals", "t.me/Aziz_deals" or a
+    full https://t.me/Aziz_deals link. Returns the plain channel
+    name, or None when it does not look like one.
+    """
+    value = (arg or "").strip().lstrip("@")
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = value.strip("/").split("/")[0].split("?")[0]
+    if re.fullmatch(r"[A-Za-z0-9_]{5,64}", value or ""):
+        return value
+    return None
+
+
+async def addchannel_command(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a channel to the search/watch list (/addchannel <channel>).
+
+    Ali only. The channel is added in memory for this run — to keep
+    it forever, edit OFFER_CHANNELS in bot.py and redeploy. The
+    channel must be public (t.me/s/<channel> must load).
+    """
+    if not is_allowed(update.effective_user.id):
+        return  # silently ignore strangers: do not confirm the bot exists
+    arg = " ".join(context.args).strip() if context.args else ""
+    channel = _parse_channel_arg(arg)
+    if not channel:
+        await update.message.reply_text(
+            "ابعت اسم القناة كده: /addchannel Aziz_deals\n"
+            "أو اللينك: /addchannel https://t.me/Aziz_deals")
+        return
+    if channel in _offer_channels():
+        await update.message.reply_text(
+            f"قناة {channel} موجودة أصلاً في قايمة السيرش. ✅")
+        return
+    # Verify it is a public channel with posts before adding it.
+    import asyncio
+
+    try:
+        posts = await asyncio.to_thread(_fetch_channel_posts, channel)
+    except Exception:  # noqa: BLE001 - treat as not found
+        posts = []
+    if not posts:
+        await update.message.reply_text(
+            f"مقدرتش أفتح قناة {channel} — اتأكد إنها عامة وإن الاسم صح، "
+            "وجرّب تاني. (القنوات الخاصة مش بتتفتح من الويب.)")
+        return
+    EXTRA_CHANNELS.add(channel)
+    await update.message.reply_text(
+        f"تمام، ضفت قناة {channel} للسيرش والمراقبة. ✅\n"
+        f"لقيت فيها {len(posts)} بوست أخير.\n\n"
+        "ملحوظة: الإضافة دي مؤقتة — لو البوت اتقفل ورجع اشتغل هتروح. "
+        "عشان تبقى دايمة، ضيف اسمها في OFFER_CHANNELS في ملف bot.py "
+        "وارفع النسخة الجديدة على GitHub.")
 
 
 async def help_command(update: Update,
@@ -671,6 +942,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("addchannel", addchannel_command))
     app.add_handler(CommandHandler("new", clear_history))
     app.add_handler(CommandHandler("clear", clear_history))
     # Text messages first, then anything else (photo, voice, sticker...).
