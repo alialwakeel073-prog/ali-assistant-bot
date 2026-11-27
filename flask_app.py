@@ -5,9 +5,11 @@ PythonAnywhere free hosting runs a WSGI app (no long-running process,
 no Render-style webhook server), so this file exposes the bot as a
 plain Flask app:
 
-- GET  /                     -> health check, "OK" (no keys needed)
-- POST /<TELEGRAM_BOT_TOKEN> -> Telegram webhook endpoint. The token
-  in the URL path is the secret, exactly like Render's url_path.
+ - GET  /                     -> health check, {"status": "ok"} only
+- POST /webhook               -> Telegram webhook endpoint. Telegram
+  sends WEBHOOK_SECRET back in the X-Telegram-Bot-Api-Secret-Token
+  header with every update; the secret NEVER appears in the URL,
+  because server access logs record full request URLs.
 
 The python-telegram-bot Application is created once and lives on a
 dedicated asyncio event loop running in a background thread, because
@@ -37,8 +39,17 @@ from telegram import Update
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+# httpx logs every request line at INFO, and Telegram API URLs contain
+# the bot token — keep httpx/httpcore at WARNING so the token is never
+# written to the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = Flask(__name__)
+
+# Security: refuse webhook POSTs bigger than 1 MB, so a huge fake
+# update cannot exhaust memory. Telegram updates are small JSON.
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Lazy PTB application on a dedicated event loop (background thread)
@@ -103,15 +114,28 @@ def _ensure_ptb_app():
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def health_check():
-    """Health check — works with no keys set, used by PythonAnywhere."""
-    return jsonify({"status": "ok", "bot": "ali-assistant-bot"}), 200
+    """Health check — works with no keys set, used by PythonAnywhere.
+    Returns only {"status": "ok"}: no bot name, no version, nothing
+    that identifies the service."""
+    return jsonify({"status": "ok"}), 200
 
 
-@app.route("/<path:token>", methods=["POST"])
-def telegram_webhook(token: str):
-    """Telegram webhook endpoint. The token in the path is the secret."""
-    expected = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    if not expected or token != expected:
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    """Telegram webhook endpoint, guarded by the secret_token header.
+
+    Telegram sends WEBHOOK_SECRET in the
+    X-Telegram-Bot-Api-Secret-Token header with every update
+    (header lookup is case-insensitive). If WEBHOOK_SECRET is
+    unset, every request is denied (403) — there is no fallback
+    to the bot token, and no secret ever appears in the URL.
+    POSTs to any other path return 404.
+    """
+    expected = os.getenv("WEBHOOK_SECRET", "")
+    # request.headers is case-insensitive, so this also matches
+    # "x-telegram-bot-api-secret-token" in any casing.
+    provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not expected or provided != expected:
         abort(403)
 
     data = request.get_json(force=True, silent=True)
@@ -132,9 +156,3 @@ def telegram_webhook(token: str):
         return jsonify({"status": "error",
                         "error": "telegram application unavailable"}), 500
     return jsonify({"status": "ok"}), 200
-
-
-@app.route("/<path:token>", methods=["GET"])
-def webhook_get(token: str):
-    """Telegram never GETs the webhook; answer plainly instead of 404."""
-    abort(405)
