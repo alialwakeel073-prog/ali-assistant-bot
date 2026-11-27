@@ -1,0 +1,12 @@
+name: Offer watcher trigger
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+jobs:
+  watchcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger bot watcher
+        run: |
+          curl -s -X POST -H "X-Telegram-Bot-Api-Secret-Token: ${{ secrets.WEBHOOK_SECRET }}" https://alialwakeel07.pythonanywhere.com/watchcheck
