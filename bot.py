@@ -260,6 +260,28 @@ def _search_words(query: str) -> tuple[list[str], bool]:
     return content, today_only
 
 
+def _matching_excerpt(text: str, words: list[str], limit: int = 200) -> str:
+    """Excerpt of a post that shows the MATCHING lines, not the start.
+
+    Deal posts bundle several products in one post, so the first
+    200 characters can be about a totally different product (e.g. a
+    tote bag) while the searched product (e.g. a shoe) sits further
+    down the same post. Showing only the start made correct matches
+    look wrong. Prefer the lines that contain a search word; fall
+    back to the start when no line matches.
+    """
+    if not text:
+        return ""
+    norm_words = [w.strip().lower() for w in words if w.strip()]
+    if norm_words:
+        hits = [ln.strip() for ln in text.splitlines()
+                if ln.strip() and any(w in ln.lower() for w in norm_words)]
+        if hits:
+            joined = " | ".join(hits)
+            return joined[:limit]
+    return text[:limit]
+
+
 def _today_str() -> str:
     """Today's date (YYYY-MM-DD) in Riyadh time, the user's clock."""
     try:
@@ -1127,8 +1149,9 @@ async def search_command(update: Update,
         return
     where = "من قنوات تليجرام"
     lines = [f"لقيت {len(results)} نتيجة عن «{query}» {where}:\n"]
+    words, _today = _search_words(query)
     for post in results:
-        excerpt = post["text"][:200]
+        excerpt = _matching_excerpt(post["text"], words)
         date = f" ({post['date']})" if post["date"] else ""
         if post.get("from_image"):
             image_note = (post.get("image_text", "")[:200] or "")
